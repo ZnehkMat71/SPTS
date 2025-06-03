@@ -209,162 +209,101 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $school_year = trim($_POST['school_year']);
                     $password = $_POST['password'] ?? '';
 
-                    // Enhanced validation
-                    if (empty($new_student_id) || empty($fullname) || empty($course) || empty($sip_center) || empty($school_year)) {
-                        throw new Exception("All fields are required.");
-                    }
-
-                    if (!preg_match('/^\d{4}-\d{4}$/', $school_year)) {
-                        throw new Exception("School year must be in YYYY-YYYY format.");
-                    }
-
                     // Start transaction
                     $conn->begin_transaction();
 
-                    // Get original student data for verification
-                    $stmt = $conn->prepare("SELECT s.student_id, s.password as student_password, u.password as user_password, s.supervisor 
-                                          FROM students s 
-                                          JOIN users u ON u.role = 'student' AND u.identifier = s.student_id 
-                                          WHERE s.student_id = ?");
+                    // Get current student info
+                    $stmt = $conn->prepare("SELECT supervisor FROM students WHERE student_id = ?");
+                    if (!$stmt) {
+                        throw new Exception("Database error: " . $conn->error);
+                    }
                     $stmt->bind_param("s", $original_student_id);
                     $stmt->execute();
-                    $original_data = $stmt->get_result()->fetch_assoc();
+                    $old_supervisor = $stmt->get_result()->fetch_assoc();
+                    $old_supervisor_id = $old_supervisor ? $old_supervisor['supervisor'] : null;
 
-                    if (!$original_data) {
-                        throw new Exception("Student not found.");
+                    // Find supervisor for the selected course
+                    $stmt = $conn->prepare("SELECT id, required_hours FROM supervisors WHERE course = ? LIMIT 1");
+                    if (!$stmt) {
+                        throw new Exception("Database error: " . $conn->error);
                     }
-
-                    // Only check for duplicate student ID if it's being changed (case-insensitive comparison)
-                    if (strtolower($original_student_id) !== strtolower($new_student_id)) {
-                        // Check if the new student ID exists in either table
-                        $stmt = $conn->prepare("SELECT COUNT(*) as count FROM students WHERE LOWER(student_id) = LOWER(?) AND student_id != ?");
-                        $stmt->bind_param("ss", $new_student_id, $original_student_id);
-                        $stmt->execute();
-                        $count1 = $stmt->get_result()->fetch_assoc()['count'];
-
-                        $stmt = $conn->prepare("SELECT COUNT(*) as count FROM users WHERE LOWER(identifier) = LOWER(?) AND role = 'student' AND identifier != ?");
-                        $stmt->bind_param("ss", $new_student_id, $original_student_id);
-                        $stmt->execute();
-                        $count2 = $stmt->get_result()->fetch_assoc()['count'];
-                        
-                        if ($count1 > 0 || $count2 > 0) {
-                            throw new Exception("Student ID already exists.");
-                        }
-
-                        // Update users table first to maintain referential integrity
-                        $user_sql = "UPDATE users SET 
-                            fullname = ?, 
-                            identifier = ?";
-                        
-                        $user_params = [$fullname, $new_student_id];
-                        $user_types = "ss";
-
-                        if ($hashed_password) {
-                            $user_sql .= ", password = ?";
-                            $user_params[] = $hashed_password;
-                            $user_types .= "s";
-                        }
-
-                        $user_sql .= " WHERE role = 'student' AND identifier = ?";
-                        $user_params[] = $original_student_id;
-                        $user_types .= "s";
-
-                        $stmt = $conn->prepare($user_sql);
-                        $stmt->bind_param($user_types, ...$user_params);
-                        $stmt->execute();
-
-                        // Then update the students table
-                        $sql = "UPDATE students SET 
-                            student_id = ?,
-                            fullname = ?,
-                            course = ?,
-                            sip_center = ?,
-                            school_year = ?,
-                            supervisor = ?";
-                            
-                        $params = [$new_student_id, $fullname, $course, $sip_center, $school_year, $supervisor_id];
-                        $types = "sssssi";
-
-                        if ($hashed_password) {
-                            $sql .= ", password = ?";
-                            $params[] = $hashed_password;
-                            $types .= "s";
-                        }
-
-                        $sql .= " WHERE student_id = ?";
-                        $params[] = $original_student_id;
-                        $types .= "s";
-
-                        $stmt = $conn->prepare($sql);
-                        $stmt->bind_param($types, ...$params);
-                        $stmt->execute();
-                    } else {
-                        // If student ID hasn't changed, just update other fields
-                        $sql = "UPDATE students SET 
-                            fullname = ?,
-                            course = ?,
-                            sip_center = ?,
-                            school_year = ?,
-                            supervisor = ?";
-                            
-                        $params = [$fullname, $course, $sip_center, $school_year, $supervisor_id];
-                        $types = "ssssi";
-
-                        if ($hashed_password) {
-                            $sql .= ", password = ?";
-                            $params[] = $hashed_password;
-                            $types .= "s";
-                        }
-
-                        $sql .= " WHERE student_id = ?";
-                        $params[] = $original_student_id;
-                        $types .= "s";
-
-                        $stmt = $conn->prepare($sql);
-                        $stmt->bind_param($types, ...$params);
-                        $stmt->execute();
-
-                        // Update users table
-                        $user_sql = "UPDATE users SET fullname = ?";
-                        $user_params = [$fullname];
-                        $user_types = "s";
-
-                        if ($hashed_password) {
-                            $user_sql .= ", password = ?";
-                            $user_params[] = $hashed_password;
-                            $user_types .= "s";
-                        }
-
-                        $user_sql .= " WHERE role = 'student' AND identifier = ?";
-                        $user_params[] = $original_student_id;
-                        $user_types .= "s";
-
-                        $stmt = $conn->prepare($user_sql);
-                        $stmt->bind_param($user_types, ...$user_params);
-                        $stmt->execute();
-                    }
-
-                    // Verify the update was successful
-                    $stmt = $conn->prepare("SELECT s.student_id as student_identifier, s.password as student_password,
-                                          u.identifier as user_identifier, u.password as user_password
-                                          FROM students s 
-                                          JOIN users u ON u.role = 'student' AND u.identifier = s.student_id 
-                                          WHERE s.student_id = ?");
-                    $stmt->bind_param("s", $new_student_id);
+                    $stmt->bind_param("s", $course);
                     $stmt->execute();
-                    $result = $stmt->get_result()->fetch_assoc();
-                    
-                    if (!$result) {
-                        throw new Exception("Failed to verify student update.");
+                    $new_supervisor = $stmt->get_result()->fetch_assoc();
+
+                    if (!$new_supervisor) {
+                        throw new Exception("No supervisor found for the selected course");
                     }
+
+                    // Hash password if provided
+                    $hashed_password = !empty($password) ? password_hash($password, PASSWORD_DEFAULT) : null;
+
+                    // Update student record
+                    $sql = "UPDATE students SET 
+                           fullname = ?,
+                           course = ?,
+                           sip_center = ?,
+                           school_year = ?,
+                           supervisor = ?,
+                           hours = ?";
                     
-                    // Verify student ID and password synchronization
-                    if ($result['student_identifier'] !== $result['user_identifier']) {
-                        throw new Exception("Failed to synchronize student ID between tables.");
+                    $params = [$fullname, $course, $sip_center, $school_year, $new_supervisor['id'], $new_supervisor['required_hours']];
+                    $types = "ssssii";
+
+                    if ($hashed_password) {
+                        $sql .= ", password = ?";
+                        $params[] = $hashed_password;
+                        $types .= "s";
                     }
-                    
-                    if ($hashed_password && $result['student_password'] !== $result['user_password']) {
-                        throw new Exception("Failed to synchronize password between tables.");
+
+                    if ($new_student_id !== $original_student_id) {
+                        $sql .= ", student_id = ?";
+                        $params[] = $new_student_id;
+                        $types .= "s";
+                    }
+
+                    $sql .= " WHERE student_id = ?";
+                    $params[] = $original_student_id;
+                    $types .= "s";
+
+                    $stmt = $conn->prepare($sql);
+                    if (!$stmt) {
+                        throw new Exception("Database error: " . $conn->error);
+                    }
+                    $stmt->bind_param($types, ...$params);
+                    if (!$stmt->execute()) {
+                        throw new Exception("Error updating student: " . $stmt->error);
+                    }
+
+                    // Update users table
+                    $user_sql = "UPDATE users SET 
+                                fullname = ?";
+                    $user_params = [$fullname];
+                    $user_types = "s";
+
+                    if ($new_student_id !== $original_student_id) {
+                        $user_sql .= ", identifier = ?";
+                        $user_params[] = $new_student_id;
+                        $user_types .= "s";
+                    }
+
+                    if ($hashed_password) {
+                        $user_sql .= ", password = ?";
+                        $user_params[] = $hashed_password;
+                        $user_types .= "s";
+                    }
+
+                    $user_sql .= " WHERE role = 'student' AND identifier = ?";
+                    $user_params[] = $original_student_id;
+                    $user_types .= "s";
+
+                    $stmt = $conn->prepare($user_sql);
+                    if (!$stmt) {
+                        throw new Exception("Database error: " . $conn->error);
+                    }
+                    $stmt->bind_param($user_types, ...$user_params);
+                    if (!$stmt->execute()) {
+                        throw new Exception("Error updating user: " . $stmt->error);
                     }
 
                     $conn->commit();
@@ -781,7 +720,7 @@ $sip_centers = $conn->query("SELECT DISTINCT sip_center FROM sip_supervisors ORD
                             <span class="input-group-text bg-light border-end-0">
                                 <i class="fas fa-lock text-muted"></i>
                             </span>
-                            <input type="password" class="form-control border-start-0" name="password" required>
+                            <input type="text" class="form-control border-start-0" name="password" required>
                         </div>
                     </div>
                     <div class="mb-3">
@@ -1065,4 +1004,4 @@ document.addEventListener('DOMContentLoaded', function() {
          });
     }
 });
-</script> 
+</script>
